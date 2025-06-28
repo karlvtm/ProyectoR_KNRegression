@@ -1,0 +1,404 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(PerformanceAnalytics)
+library(caret)
+library(tidymodels)
+library(tidyverse)
+library(DataExplorer)
+library(inspectdf)
+library(glmnet)
+library(leaps)
+library(kernlab)
+```
+
+
+```{r}
+dataTrain = read.csv("train.csv")
+head(dataTrain)
+```
+
+```{r}
+dataTest = read.csv("test.csv")
+head(dataTest)
+```
+
+```{r}
+# Variables discretas y continuas
+inspect_types(dataTrain)
+
+# Cantidad de NA's
+inspect_na(dataTrain)
+
+# Análisis de variables numéricas
+inspect_num(dataTrain)
+
+#Análisis de variables categóricas
+inspect_cat(dataTrain)
+```
+
+```{r}
+# Variables discretas y continuas
+inspect_types(dataTest)
+
+# Cantidad de NA's
+inspect_na(dataTest)
+
+# Análisis de variables numéricas
+inspect_num(dataTest)
+
+#Análisis de variables categóricas
+inspect_cat(dataTest)
+```
+
+
+
+# Preparación del Pipeline
+```{r}
+num_feature = inspectdf::inspect_num(dataTrain)
+cat_feature = inspectdf::inspect_cat(dataTrain)
+
+# Columnas a eliminar por tener mas del 20% de vacíos 
+features_na_analisis = inspectdf::inspect_na(dataTrain)
+
+# aGREGAMOS columnas no utiles
+DROP_FEATURES = c('id')
+
+#Columnas para imputación por mediana
+NUMERICAL_FEATURES_2_IMPUTE = features_na_analisis %>% 
+  filter(pcnt > 0, pcnt <= 20.0) %>% 
+  filter(col_name %in% num_feature$col_name) %>% 
+  pull(col_name)
+  
+# Columnas para imputación por moda
+CATEGORICAL_FEATURES_2_IMPUTE = features_na_analisis %>% 
+  filter(pcnt > 0, pcnt <= 20.0) %>% 
+  filter(col_name %in% cat_feature$col_name) %>% 
+  pull(col_name)
+
+CONTINUES_FEATURES_2_TRANSFORM<-c()
+```
+
+
+```{r}
+# funcion de winsorización
+winsor_limits <- function(dataTrain, vars, lower = 0.01, upper = 0.99) {
+  limits <- purrr::map_dfr(vars, function(var) {
+    q <- quantile(dataTrain[[var]], probs = c(lower, upper), na.rm = TRUE)
+    tibble(variable = var, p01 = q[1], p99 = q[2])
+  })
+  return(limits)
+}
+
+vars_winsorizar <- c("longitude","latitude", "housing_median_age", "total_rooms", "total_bedrooms", "population", "households", "median_income")
+
+limites <- winsor_limits(dataTrain, vars_winsorizar)
+```
+
+
+# Pipeline de ingeniería de carácterísticas
+```{r}
+recDataTrain = recipe(median_house_value ~ .,
+                 data = dataTrain) %>% 
+  step_rm(all_of(DROP_FEATURES)) %>% 
+  step_impute_median(all_of(NUMERICAL_FEATURES_2_IMPUTE)) %>%
+  step_impute_mode(all_of(CATEGORICAL_FEATURES_2_IMPUTE)) %>% 
+  step_mutate(
+    longitude = pmin(pmax(longitude, limites$p01[limites$variable == "longitude"]),
+                         limites$p99[limites$variable == "longitude"]),
+    latitude = pmin(pmax(latitude, limites$p01[limites$variable == "latitude"]),
+                       limites$p99[limites$variable == "latitude"]),
+    housing_median_age = pmin(pmax(housing_median_age, limites$p01[limites$variable == "housing_median_age"]),
+                         limites$p99[limites$variable == "housing_median_age"]),
+    total_rooms = pmin(pmax(total_rooms, limites$p01[limites$variable == "total_rooms"]),
+                       limites$p99[limites$variable == "total_rooms"]),
+    total_bedrooms = pmin(pmax(total_bedrooms, limites$p01[limites$variable == "total_bedrooms"]),
+                       limites$p99[limites$variable == "total_bedrooms"]),
+    population = pmin(pmax(population, limites$p01[limites$variable == "population"]),
+                      limites$p99[limites$variable == "population"]),
+    households = pmin(pmax(households, limites$p01[limites$variable == "households"]),
+                      limites$p99[limites$variable == "households"]),
+    median_income = pmin(pmax(median_income, limites$p01[limites$variable == "median_income"]),
+                         limites$p99[limites$variable == "median_income"])
+  ) %>%
+  step_integer(all_nominal()) %>%
+  step_mutate(
+    total_rooms = log1p(total_rooms),
+    population = log1p(population),
+    median_income = log1p(median_income)
+  ) %>% 
+  step_normalize(all_numeric_predictors()) #
+  step_scale(all_numeric_predictors()) #
+  
+
+pipeline = prep(recDataTrain)
+
+dataTrain_Transformed = bake(pipeline, new_data = dataTrain)
+```
+
+```{r}
+head(dataTrain_Transformed)
+```
+
+```{r warning=FALSE}
+chart.Correlation(dataTrain_Transformed)
+```
+
+```{r}
+# Variables discretas y continuas
+inspect_types(dataTrain_Transformed)
+
+# Cantidad de NA's
+inspect_na(dataTrain_Transformed)
+
+# Análisis de variables numéricas
+inspect_num(dataTrain_Transformed)
+
+#Análisis de variables categóricas
+inspect_cat(dataTrain_Transformed)
+```
+
+# Mecanismo de crossvalidation
+```{r}
+repeatedKfoldsDriver = trainControl(method = "repeatedcv",
+                                    number = 10,
+                                    repeats = 10)
+
+simpleKfoldsDriver = trainControl(method = "cv",
+                                  number = 10
+                                  )
+```
+
+### Linear
+```{r}
+simple_linear_reg = train(form = median_house_value ~ .,
+                          data = dataTrain_Transformed,
+                          method = "lm",
+                          trControl = repeatedKfoldsDriver
+                          )
+
+simple_linear_reg$results
+```
+
+### Logistic Reg
+```{r}
+modelo_log = train(median_house_value ~ .,
+                     data = dataTrain_Transformed,
+                     method = "glm",
+                     trControl = repeatedKfoldsDriver
+                    )
+
+modelo_log$results
+```
+
+### Ridge Reg
+```{r}
+ridge_regression = train(form = median_house_value ~.,
+                        data=dataTrain_Transformed,
+                        method='glmnet',
+                        trControl=repeatedKfoldsDriver,
+                        tuneGrid=expand.grid(alpha=0, lambda=seq(0.0001, 1, length=5))
+                        )
+
+ridge_regression$bestTune
+ridge_regression$results
+```
+
+### LASSO Reg
+```{r}
+lasso_regression = train(form = median_house_value ~.,
+                        data=dataTrain_Transformed,
+                        method='glmnet',
+                        trControl=repeatedKfoldsDriver,
+                        tuneGrid=expand.grid(alpha=1, lambda=seq(0.0001, 1, length=5))
+                        )
+
+lasso_regression$bestTune
+lasso_regression$results
+```
+
+### Elastic Net
+```{r}
+elastic_net_regression = train(form = median_house_value ~.,
+                        data=dataTrain_Transformed,
+                        method='glmnet',
+                        trControl=repeatedKfoldsDriver,
+                        tuneGrid=expand.grid(alpha=seq(0, 1, length=5), 
+                                             lambda=seq(0.0001, 1, length=5))
+                        )
+
+elastic_net_regression$bestTune
+elastic_net_regression$results
+```
+
+### KNN
+```{r}
+knn_reg = train(form = median_house_value ~ .,
+                data = dataTrain_Transformed,
+                method = "knn",
+                trControl = repeatedKfoldsDriver,
+                tuneGrid = expand.grid(k = c(3, 5, 7, 9, 11))
+                )
+
+knn_reg$bestTune
+knn_reg$results
+```
+
+### SVR
+```{r}
+svr.hyper_params = expand.grid(C = 1, sigma = 0.05)
+
+svr_regression = train(form = median_house_value ~ .,
+                       data = dataTrain_Transformed,
+                       method = "svmRadial",
+                       trControl = simpleKfoldsDriver
+                       )
+
+#svr_regression$bestTune
+svr_regression$results
+```
+
+### Decision Tree
+```{r}
+modelo_tree = train(median_house_value ~ .,
+                     data = dataTrain_Transformed,
+                     method = "rpart",
+                     trControl = repeatedKfoldsDriver,
+                     tuneGrid=expand.grid(cp = seq(0.001, 0.1, 0.0005))
+                     )
+
+modelo_tree$bestTune
+modelo_tree$results
+```
+
+### Random Forest
+```{r}
+rf.hyper_params = expand.grid(.mtry = c(2, 4, 6, 8, 10))
+
+rf_model = train(form = median_house_value ~ .,
+                 data = dataTrain_Transformed,
+                 method = "rf",
+                 trControl = simpleKfoldsDriver,
+                 tuneGrid = rf.hyper_params
+                 )
+
+rf_model$bestTune
+rf_model$results
+```
+
+
+# Prediccion del modelo escogido
+
+### Preparación del Pipeline de DataTest
+```{r}
+num_feature = inspectdf::inspect_num(dataTest)
+cat_feature = inspectdf::inspect_cat(dataTest)
+
+# Columnas a eliminar por tener mas del 20% de vacíos 
+features_na_analisis = inspectdf::inspect_na(dataTest)
+
+# aGREGAMOS columnas no utiles
+DROP_FEATURES = c('id')
+
+#Columnas para imputación por mediana
+NUMERICAL_FEATURES_2_IMPUTE = features_na_analisis %>% 
+  filter(pcnt > 0, pcnt <= 20.0) %>% 
+  filter(col_name %in% num_feature$col_name) %>% 
+  pull(col_name)
+  
+# Columnas para imputación por moda
+CATEGORICAL_FEATURES_2_IMPUTE = features_na_analisis %>% 
+  filter(pcnt > 0, pcnt <= 20.0) %>% 
+  filter(col_name %in% cat_feature$col_name) %>% 
+  pull(col_name)
+
+CONTINUES_FEATURES_2_TRANSFORM<-c()
+```
+
+
+```{r}
+# funcion de winsorización de DataTest
+winsor_limits <- function(dataTest, vars, lower = 0.01, upper = 0.99) {
+  limits <- purrr::map_dfr(vars, function(var) {
+    q <- quantile(dataTest[[var]], probs = c(lower, upper), na.rm = TRUE)
+    tibble(variable = var, p01 = q[1], p99 = q[2])
+  })
+  return(limits)
+}
+
+vars_winsorizar <- c("longitude","latitude", "housing_median_age", "total_rooms", "total_bedrooms", "population", "households", "median_income")
+
+limites <- winsor_limits(dataTest, vars_winsorizar)
+```
+
+
+### Pipeline de ingeniería de carácterísticas de DataTest
+```{r}
+recDataTest = recipe(
+                 data = dataTest) %>% 
+  step_rm(all_of(DROP_FEATURES)) %>% 
+  step_impute_median(all_of(NUMERICAL_FEATURES_2_IMPUTE)) %>%
+  step_impute_mode(all_of(CATEGORICAL_FEATURES_2_IMPUTE)) %>% 
+  step_mutate(
+    longitude = pmin(pmax(longitude, limites$p01[limites$variable == "longitude"]),
+                         limites$p99[limites$variable == "longitude"]),
+    latitude = pmin(pmax(latitude, limites$p01[limites$variable == "latitude"]),
+                       limites$p99[limites$variable == "latitude"]),
+    housing_median_age = pmin(pmax(housing_median_age, limites$p01[limites$variable == "housing_median_age"]),
+                         limites$p99[limites$variable == "housing_median_age"]),
+    total_rooms = pmin(pmax(total_rooms, limites$p01[limites$variable == "total_rooms"]),
+                       limites$p99[limites$variable == "total_rooms"]),
+    total_bedrooms = pmin(pmax(total_bedrooms, limites$p01[limites$variable == "total_bedrooms"]),
+                       limites$p99[limites$variable == "total_bedrooms"]),
+    population = pmin(pmax(population, limites$p01[limites$variable == "population"]),
+                      limites$p99[limites$variable == "population"]),
+    households = pmin(pmax(households, limites$p01[limites$variable == "households"]),
+                      limites$p99[limites$variable == "households"]),
+    median_income = pmin(pmax(median_income, limites$p01[limites$variable == "median_income"]),
+                         limites$p99[limites$variable == "median_income"])
+  ) %>%
+  step_integer(all_nominal()) %>%
+  step_mutate(
+    total_rooms = log1p(total_rooms),
+    population = log1p(population),
+    median_income = log1p(median_income)
+  ) %>% 
+  step_normalize(all_numeric_predictors()) #
+  step_scale(all_numeric_predictors()) #
+  
+
+pipeline = prep(recDataTest)
+
+dataTest_Transformed = bake(pipeline, new_data = dataTest)
+```
+
+```{r}
+dataTest_Transformed
+```
+
+
+### Predicción usando el modelo champion (Random Forest)
+```{r}
+rf_pred = predict(rf_model, newdata = dataTest_Transformed)
+
+rf_pred
+```
+
+#conversion a csv
+```{r}
+pred_vector = as.vector(t(rf_pred))
+
+res = data.frame(
+  id = dataTest$id,
+  median_house_value = pred_vector
+)
+
+write.csv(res, "Predicciones_equipo_KNRegression.csv", row.names = FALSE)
+```
+
+
